@@ -1,0 +1,619 @@
+from itertools import islice
+from typing import Literal
+
+import lightning as pl
+import numpy as np
+import torch
+from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+from numpy import dtype, ndarray
+from torch import Tensor
+from torch.nn import functional as F
+from torch.optim import AdamW
+from transformers import PreTrainedTokenizer
+
+import wandb
+from shortcutfm.batch import EncoderBatch
+from shortcutfm.config import SchedulerConfig
+from shortcutfm.criteria import CompositeCriterion
+from shortcutfm.decoding.prediction_strategies import PredictionStrategy
+from shortcutfm.decoding.text_processing import process_batch_predictions
+from shortcutfm.evaluation import compute_bleu_from_batch
+from shortcutfm.train.optim import SchedulerFactory
+
+
+class TrainModule(pl.LightningModule):
+    def __init__(
+        self,
+        criterion: CompositeCriterion,
+        optimizer_config: SchedulerConfig,
+        tokenizer: PreTrainedTokenizer | None = None,
+        prediction_strategy: PredictionStrategy | None = None,
+        prediction_shortcut_size: int = 64,
+        denoising_step_size: int = 32,
+        num_val_batches_to_log: int = 2,
+        num_timestep_bins: int = 4,  # Number of bins for timestep logging
+        log_train_predictions_every_n_epochs: int = 100,  # Number of epochs between train prediction logging
+        log_train_predictions_from_n_epochs: int = 1000,  # Number of epochs between train prediction logging
+        normalize_embeddings: bool = False,  # Whether to normalize embeddings after optimizer step
+    ) -> None:
+        super().__init__()
+        self.criterion = criterion
+        self.optimizer_config = optimizer_config
+        self.normalize_embeddings = normalize_embeddings
+
+        self.tokenizer = tokenizer
+        self.prediction_strategy = prediction_strategy
+        self.prediction_shortcut_size = prediction_shortcut_size
+        self.denoising_step_size = denoising_step_size
+        self.num_val_batches_to_log = num_val_batches_to_log
+        self.log_train_predictions_every_n_epochs = log_train_predictions_every_n_epochs
+        self.log_train_predictions_from_n_epochs = log_train_predictions_from_n_epochs
+        self.predictions = []  # For validation predictions
+        self.train_predictions = []  # For training predictions
+        self.train_prediction_batch = None  # Store one batch for full denoising
+
+        # Setup timestep bins using linear spacing
+        max_timestep = self.criterion.diffusion_steps  # Maximum timestep value
+        # Create linearly spaced bin edges
+        self.timestep_bins = np.linspace(0, max_timestep, num_timestep_bins + 1, dtype=int)
+
+        # Initialize dictionaries to store losses for each component and bin
+        self.timestep_losses = {}  # Will be populated with loss components in training_step
+
+        # Initialize lists to store exact timesteps and shortcuts for histogram logging
+        self.timesteps_for_histogram = []
+        self.shortcuts_for_histogram = []
+
+        self.save_hyperparameters(ignore=["criterion", "prediction_strategy", "tokenizer"])
+
+    def forward(self, batch: EncoderBatch) -> dict[str, Tensor]:
+        # Add global_step as an attribute to the batch for the criterion to use
+        if hasattr(self, "trainer") and hasattr(self.trainer, "global_step"):
+            batch.global_step = self.trainer.global_step
+        return self.criterion(batch, self.trainer.world_size)
+
+    def training_step(self, batch: EncoderBatch, batch_idx: int) -> Tensor:
+        outputs = self(batch)
+
+        # Store one batch of the epoch for full denoising
+        if self.train_prediction_batch is None:
+            self.train_prediction_batch = batch
+
+        # Log only loss-related metrics
+        loss_metrics = {f"train/{k}": v.mean() for k, v in outputs.items() if "loss" in k.lower()}
+        self.log_dict(loss_metrics, on_step=True, on_epoch=False, prog_bar=True,
+                     batch_size=batch.seqs.size(0), sync_dist=True)
+
+        # Store exact timesteps and shortcuts for histogram logging
+        if "timestep" in outputs:
+            self.timesteps_for_histogram.extend(outputs["timestep"].detach().cpu().numpy().tolist())
+        if "shortcut" in outputs:
+            self.shortcuts_for_histogram.extend(outputs["shortcut"].detach().cpu().numpy().tolist())
+
+        # Process and store timestep losses
+        self._process_timestep_losses(outputs)
+
+        return outputs["loss"].mean()
+
+    def _process_timestep_losses(self, outputs: dict[str, Tensor]) -> None:
+        """Process and store losses for each timestep bin.
+
+        This method processes the loss components for each timestep,
+        bins them according to timestep values, and stores them for later logging.
+
+        :param outputs: Dictionary containing model outputs including losses and timesteps
+        :type outputs: dict[str, Tensor]
+        """
+        if "timestep" not in outputs:
+            return
+
+        timesteps = outputs["timestep"]  # Shape: [batch_size]
+
+        # Process each loss term except total loss
+        for key, value in outputs.items():
+            if "loss" in key.lower() and key not in [
+                "loss",
+                "embedding_loss",
+                "isotropy_loss",
+            ]:
+                # Initialize storage for this loss component if not exists
+                if key not in self.timestep_losses:
+                    self.timestep_losses[key] = [[] for _ in range(len(self.timestep_bins) - 1)]
+
+                losses = value.detach()  # Shape: [batch_size] or scalar
+
+                # If loss is scalar, expand it to match batch size
+                if losses.ndim == 0:
+                    losses = losses.expand(timesteps.shape[0])
+
+                # Process each timestep-loss pair in the batch
+                for timestep, loss in zip(timesteps, losses, strict=False):
+                    bin_idx = self._get_timestep_bin(timestep.item())
+                    if 0 <= bin_idx < len(self.timestep_bins) - 1:
+                        self.timestep_losses[key][bin_idx].append(loss.item())
+
+    def _get_timestep_bin(self, timestep: int) -> int:
+        """Get the bin index for a given timestep using linear bins."""
+        bin_size = self.criterion.diffusion_steps // (len(self.timestep_bins) - 1)
+        return min(timestep // bin_size, len(self.timestep_bins) - 2)
+
+    def on_train_epoch_end(self) -> None:
+        """Log average losses for each timestep bin and full denoising predictions for one batch."""
+        self._log_timestep_bin_losses()
+        self._log_sampling_histograms()
+        # self._process_train_batch_predictions()
+        self.log_anisotropy()
+
+    def _log_timestep_bin_losses(self) -> None:
+        """Log average losses for each timestep bin and clear the loss storage.
+
+        This method processes the accumulated losses for each timestep bin,
+        computes their averages, logs them, and then clears the storage for the next epoch.
+        """
+        # Log timestep bin losses
+        for loss_name, bins in self.timestep_losses.items():
+            for bin_idx, losses in enumerate(bins):
+                if losses:  # If we have losses for this bin
+                    avg_loss = np.mean(losses)
+                    bin_start = self.timestep_bins[bin_idx]
+                    bin_end = self.timestep_bins[bin_idx + 1]
+
+                    # Log average loss for this timestep bin and component
+                    metric_name = f"train/{loss_name}_t{bin_start:04d}_t{bin_end:04d}"
+                    self.log(metric_name, avg_loss, on_step=False, on_epoch=True, sync_dist=True)
+
+        # Clear losses for next epoch
+        self.timestep_losses = {
+            key: [[] for _ in range(len(self.timestep_bins) - 1)] for key in self.timestep_losses.keys()
+        }
+
+    # noinspection PyUnresolvedReferences
+    def _log_sampling_histograms(self) -> None:
+        """Log histograms of timesteps and shortcuts sampled during training.
+
+        This method creates and logs histograms to track the distribution of:
+        - Timesteps that were sampled during training
+        - Shortcut sizes that were used
+        It also logs the count of samples for each.
+        """
+        if (
+            self.timesteps_for_histogram
+            and hasattr(self.logger, "experiment")
+            and isinstance(self.logger.experiment, wandb.sdk.wandb_run.Run)
+        ):
+            self.logger.experiment.log(  # type: ignore
+                {
+                    "train/timesteps_histogram": wandb.Histogram(self.timesteps_for_histogram),
+                    "train/timesteps_count": len(self.timesteps_for_histogram),
+                }
+            )
+            self.timesteps_for_histogram = []  # Clear for next epoch
+
+        if (
+            self.shortcuts_for_histogram
+            and hasattr(self.logger, "experiment")
+            and isinstance(self.logger.experiment, wandb.sdk.wandb_run.Run)
+        ):
+            self.logger.experiment.log(  # type: ignore
+                {
+                    "train/shortcuts_histogram": wandb.Histogram(self.shortcuts_for_histogram),
+                    "train/shortcuts_count": len(self.shortcuts_for_histogram),
+                }
+            )
+            self.shortcuts_for_histogram = []  # Clear for next epoch
+
+    def _process_train_batch_predictions(self) -> None:
+        """Process and log predictions for the saved training batch.
+
+        This method performs full denoising on the last saved training batch,
+        computes cross entropy loss, and logs the predictions along with their
+        source and reference texts.
+        """
+        log_text = (
+            self.trainer.current_epoch % self.log_train_predictions_every_n_epochs == 0
+            and self.trainer.current_epoch >= self.log_train_predictions_from_n_epochs
+        )
+        if self.train_prediction_batch is not None:
+            self._process_batch_predictions(
+                batch=self.train_prediction_batch,
+                predictions_list=self.train_predictions,
+                stage="train",
+                create_entries=log_text,
+            )
+
+            # Log the predictions table
+            if self.train_predictions and hasattr(self.logger, "log_table"):
+                columns = [
+                    "epoch",
+                    "sample_idx",
+                    "source",
+                    "reference",
+                    "predicted",
+                    "cross_entropy",
+                    "bleu",
+                ]
+                self.logger.log_table("train/predictions", columns=columns, data=self.train_predictions)  # type: ignore
+
+    def _process_batch_predictions(
+        self,
+        batch: EncoderBatch,
+        predictions_list: list,
+        batch_idx: int | None = None,
+        stage: Literal["val", "train"] = None,
+        create_entries: bool = True,
+    ) -> float:
+        """Process a batch for predictions and store results.
+
+        This method handles the full denoising process, computes cross entropy loss,
+        and stores the predictions for later logging.
+
+        :param batch: The batch to process
+        :type batch: EncoderBatch
+        :param predictions_list: List to store predictions in
+        :type predictions_list: list
+        :param batch_idx: Optional batch index to include in predictions
+        :type batch_idx: Optional[int]
+        :param stage: Stage of training (train/val) for logging
+        :type stage: Literal["val, train"]
+        :return: The cross entropy loss for this batch
+        :rtype: float
+        """
+        self.criterion.model.eval()
+        with torch.no_grad():
+            # Get logits from denoising process
+            predictions: Tensor = self.criterion.denoise(
+                batch=batch,
+                shortcut_size=self.prediction_shortcut_size,
+                probe_every_step=False,  # Only get final predictions
+                return_logits=True,  # Get logits for cross entropy
+                step_size=self.denoising_step_size,
+            )
+
+            ce_loss = self._compute_masked_cross_entropy(predictions, batch)
+
+            if create_entries:
+                predicted_tokens = predictions.argmax(dim=-1)
+
+                source_text, reference_text, predicted_text = process_batch_predictions(
+                    batch, predicted_tokens, self.tokenizer, use_fallback_processing=False
+                )
+
+                # Compute individual BLEU scores for each example
+                # Use simple sentence-level BLEU for individual examples
+                bleu_scores = []
+                smoothing_function = SmoothingFunction().method4
+
+                for ref, hyp in zip(reference_text, predicted_text, strict=False):
+                    ref_clean = ref.strip()
+                    hyp_clean = hyp.strip()
+
+                    # Handle empty cases
+                    if not hyp_clean or not ref_clean:
+                        bleu_scores.append(0.0)
+                        continue
+
+                    # Sentence-level BLEU expects tokenized input
+                    ref_tokens = ref_clean.split()
+                    hyp_tokens = hyp_clean.split()
+
+                    try:
+                        individual_bleu = sentence_bleu(
+                            [ref_tokens], hyp_tokens, smoothing_function=smoothing_function
+                        )
+                        bleu_scores.append(individual_bleu)
+                    except Exception:
+                        bleu_scores.append(0.0)
+
+                # Create and store prediction entries
+                prediction_entries = self._create_prediction_entries(
+                    source_text=source_text,
+                    reference_text=reference_text,
+                    predicted_text=predicted_text,
+                    ce_losses=ce_loss,
+                    bleu_scores=bleu_scores,
+                    batch_idx=batch_idx,
+                )
+                predictions_list.extend(prediction_entries)
+
+            if stage:
+                self.log(
+                    f"{stage}/full_denoising_ce",
+                    ce_loss.mean().item(),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+                if stage == "train" and create_entries:
+                    # log mean bleu
+                    mean_bleu = np.mean(bleu_scores)
+                    self.log(
+                        f"{stage}/mean_bleu",
+                        float(mean_bleu),
+                        on_step=False,
+                        on_epoch=True,
+                        sync_dist=True,
+                    )
+
+        self.criterion.model.train()
+        return ce_loss.mean().item()
+
+    def _compute_masked_cross_entropy(self, predictions: Tensor, batch: EncoderBatch) -> Tensor:
+        """Compute masked cross entropy loss for predictions.
+
+        :param predictions: Model predictions [batch_size, seq_len, vocab_size]
+        :type predictions: Tensor
+        :param batch: The batch containing target sequences and masks
+        :type batch: EncoderBatch
+        :return: Masked cross entropy loss [batch_size, seq_len]
+        :rtype: Tensor
+        """
+        # Compute cross entropy between sequences
+        ce_loss = F.cross_entropy(
+            predictions.view(-1, predictions.size(-1)),
+            batch.seqs.view(-1),
+            reduction="none",
+        ).view(batch.seqs.shape)
+
+        # Apply masks and normalize
+        loss_mask = batch.input_ids_mask * batch.padding_mask
+        ce_loss = (ce_loss * loss_mask).sum(-1) / loss_mask.sum(-1)
+
+        return ce_loss
+
+    def _extract_text_parts(
+        self, batch: EncoderBatch, predicted_tokens: Tensor
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Extract source, reference and predicted text parts.
+
+        :param batch: The batch containing sequences and masks
+        :type batch: EncoderBatch
+        :param predicted_tokens: Predicted token IDs [batch_size, seq_len]
+        :type predicted_tokens: Tensor
+        :return: Tuple of (source_texts, reference_texts, predicted_texts)
+        :rtype: tuple[list[str], list[str], list[str]]
+        """
+        # Split sequences into source and reference using input_mask
+        source_tokens = batch.seqs.clone()
+        reference_tokens = batch.seqs.clone()
+
+        # Zero out reference/source parts based on input_mask
+        source_tokens[batch.input_ids_mask == 1] = self.tokenizer.pad_token_id
+        reference_tokens[batch.input_ids_mask == 0] = self.tokenizer.pad_token_id
+
+        # Decode each part separately
+        source_text = self.tokenizer.batch_decode(source_tokens, skip_special_tokens=True)
+        reference_text = self.tokenizer.batch_decode(reference_tokens, skip_special_tokens=True)
+        predicted_text = self.tokenizer.batch_decode(predicted_tokens, skip_special_tokens=False)
+
+        return source_text, reference_text, predicted_text
+
+    def _create_prediction_entries(
+        self,
+        source_text: list[str],
+        reference_text: list[str],
+        predicted_text: list[str],
+        ce_losses: Tensor,
+        bleu_scores: list[float],
+        batch_idx: int | None = None,
+        max_entries: int = 8,
+    ) -> list[list]:
+        """Create prediction entries for logging.
+
+        :param source_text: List of source text parts
+        :type source_text: list[str]
+        :param reference_text: List of reference text parts
+        :type reference_text: list[str]
+        :param predicted_text: List of predicted text parts
+        :type predicted_text: list[str]
+        :param bleu_scores: List of BLEU scores
+        :type bleu_scores: list[float]
+        :param ce_losses: Cross entropy loss value
+        :type ce_losses: float
+        :param batch_idx: Optional batch index to include in entries
+        :type batch_idx: Optional[int]
+        :return: List of prediction entries
+        :rtype: list[list]
+        """
+        entries = []
+        for i, (src, ref, pred, ce_loss, bleu) in enumerate(
+            islice(
+                zip(
+                    source_text,
+                    reference_text,
+                    predicted_text,
+                    ce_losses,
+                    bleu_scores,
+                    strict=False,
+                ),
+                max_entries,
+            )
+        ):
+            prediction_entry = [
+                self.current_epoch,
+                src.strip(),  # Remove any padding artifacts
+                ref.strip(),  # Remove any padding artifacts
+                pred,
+                ce_loss.item(),
+                bleu,
+            ]
+
+            # Insert batch_idx if provided
+            if batch_idx is not None:
+                prediction_entry.insert(1, batch_idx)
+                prediction_entry.insert(2, i)
+            else:
+                prediction_entry.insert(1, i)
+
+            entries.append(prediction_entry)
+
+        return entries
+
+    def log_anisotropy(self):
+        """Log the anisotropy of the model embeddings."""
+        if hasattr(self.criterion.model.module, "word_embedding"):
+            embedding_weights = self.criterion.model.module.word_embedding.weight
+            anisotropy = self._calculate_anisotropy(embedding_weights)
+            self.log("train/anisotropy", anisotropy, on_step=False, on_epoch=True, sync_dist=True)
+
+    @torch.no_grad()
+    def _calculate_anisotropy(self, model_emb):
+        model_emb = model_emb / torch.norm(model_emb, dim=-1, keepdim=True)
+        cos_similarity = torch.mm(model_emb, model_emb.T).sum() - model_emb.size(0)
+        anisotropy = cos_similarity / model_emb.size(0) / (model_emb.size(0) - 1)
+        return anisotropy
+
+    def validation_step(self, batch: EncoderBatch, batch_idx: int) -> Tensor:
+        outputs = self(batch)
+        self.log_dict(
+            {f"val/{k}": v.mean() for k, v in outputs.items() if "loss" in k.lower()},
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch.seqs.size(0),
+            sync_dist=True,
+        )
+
+        self.compute_and_log_bleu(batch)
+
+        # Perform full denoising and log text for a few validation batches
+        if (
+            batch_idx < self.num_val_batches_to_log
+            and self.trainer.current_epoch >= self.log_train_predictions_from_n_epochs
+        ):
+            self._process_validation_predictions(batch, batch_idx)
+
+        return outputs["loss"]
+
+    def compute_and_log_bleu(self, batch):
+        # Compute predictions and BLEU scores using shared function
+        # Use probe_every_step=True to be consistent with test_step
+        predictions = self.criterion.denoise(
+            batch=batch,
+            shortcut_size=self.prediction_shortcut_size,
+            probe_every_step=True,  # Changed to True for consistency with test_step
+            return_logits=False,
+            step_size=self.denoising_step_size,
+        )
+
+        # Use shared BLEU computation function
+        bleu_score = compute_bleu_from_batch(
+            batch=batch,
+            predicted_tokens=predictions,
+            tokenizer=self.tokenizer,
+            use_fallback_processing=False,  # Can enable if needed
+            smoothing_method=4  # Chen & Cherry smoothing
+        )
+
+        self.log("val/bleu", bleu_score, on_step=False, on_epoch=True, prog_bar=True,
+                batch_size=batch.seqs.size(0), sync_dist=True)
+
+    def _process_validation_predictions(self, batch: EncoderBatch, batch_idx: int) -> float:
+        """Process a batch for validation predictions and store results.
+
+        This method handles the full denoising process, computes cross entropy loss,
+        and stores the predictions for later logging.
+
+        :param batch: The validation batch to process
+        :type batch: EncoderBatch
+        :param batch_idx: The index of the current batch
+        :type batch_idx: int
+        :return: The cross entropy loss for this batch
+        :rtype: float
+        """
+        return self._process_batch_predictions(
+            batch=batch,
+            predictions_list=self.predictions,
+            batch_idx=batch_idx,
+            stage="val",
+        )
+
+    def on_validation_end(self) -> None:
+        """Log all predictions from the epoch to the table."""
+        if self.predictions and hasattr(self.logger, "log_table"):
+            columns = [
+                "epoch",
+                "batch",
+                "sample_idx",
+                "source",
+                "reference",
+                "predicted",
+                "cross_entropy",
+                "bleu",
+            ]
+            self.logger.log_table("val/predictions", columns=columns, data=self.predictions)
+
+    def test_step(self, batch: EncoderBatch, batch_idx: int) -> tuple[Tensor, Tensor]:
+        """Run test step and return both input sequences and model predictions.
+
+        Returns:
+            tuple[Tensor, Tensor]: A tuple containing:
+                - input_ids: Input token sequences [batch_size, seq_len]
+                - predictions: Model predictions [batch_size, num_steps, seq_len]
+
+        """
+        predictions = self.criterion.denoise(batch, self.prediction_shortcut_size, step_size=self.denoising_step_size)
+        return batch.seqs, predictions
+
+    def _predict_step(self, batch: EncoderBatch, batch_idx: int) -> ndarray[str, dtype[str]]:
+        if not self.prediction_strategy:
+            raise ValueError("Prediction strategy not set")
+
+        return self.prediction_strategy(batch, self.shortcut_size)
+
+    def set_prediction_shortcut_size(self, shortcut_size: int) -> None:
+        self.prediction_shortcut_size = shortcut_size
+
+    def configure_optimizers(self):
+        optimizer = AdamW(
+            self.criterion.model.module.parameters(),
+            lr=self.optimizer_config.lr,
+            weight_decay=self.optimizer_config.weight_decay,
+        )
+
+        scheduler = {
+            "scheduler": self._get_lr_scheduler(optimizer),
+            "interval": "step",
+            "frequency": 1,
+        }
+
+        return [optimizer], [scheduler]
+
+    def _get_lr_scheduler(self, optimizer):
+        return SchedulerFactory.get_scheduler(
+            name=self.optimizer_config.type,
+            optimizer=optimizer,
+            config=self.optimizer_config,
+        )
+
+    def on_before_zero_grad(self, optimizer) -> None:
+        """Hook called after optimizer step.
+
+        This is where we normalize the embeddings to ensure they lie on a hypersphere
+        after the gradients have been computed but before the weights are updated.
+        """
+        if self.normalize_embeddings:
+            self._normalize_embeddings_matrices()
+
+    def _normalize_embeddings_matrices(self) -> None:
+        """Normalize embedding weights to lie on a hypersphere.
+
+        This method normalizes the word embeddings of the model to have unit L2 norm,
+        effectively placing them on a hypersphere. This can help with training stability
+        and prevent embedding weights from growing too large.
+        """
+        with torch.no_grad():
+            # Normalize word embeddings
+            self.criterion.model.module.word_embedding.weight.data.copy_(
+                justnorm(self.criterion.model.module.word_embedding.weight.data, 1)
+            )
+            # Normalize language model head weights
+            self.criterion.model.module.lm_head.weight.data.copy_(
+                justnorm(self.criterion.model.module.lm_head.weight.data, 1)
+            )
+
+
+def justnorm(x, idim=-1):
+    dtype = x.dtype
+    x = x.float()
+    res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype)
+    return res

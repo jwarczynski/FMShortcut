@@ -1,0 +1,66 @@
+[project]
+name = "shorcutFM"
+version = "0.1.0"
+description = "Flow matching objective with shorcuts for faster inference with fewer sampling steps"
+authors = [
+    { name = "Jędrzej Warczyński" }
+]
+dependencies = [
+    "torch>=2.6.0",
+    "datasets>=3.3.2",
+    "lightning>=2.5.0.post0",
+    "numpy>=2.2.3",
+    "omegaconf>=2.3.0",
+    "pydantic>=2.10.6",
+    "wandb>=0.19.7",
+    "exca>=0.2.5",
+    "evaluate>=0.4.3",
+    "ipywidgets>=8.1.7",
+    "timm>=1.0.15",
+    "scikit-learn>=1.6.1",
+    "sentencepiece>=0.2.0",
+    "sacremoses>=0.1.1",
+    "matplotlib>=3.10.1",
+    "transformers==4.49.0",
+    "nltk>=3.9.1",
+    "seaborn>=0.13.2",
+    "bert-score>=0.3.13",
+    "absl-py>=2.3.1",
+    "rouge-score>=0.1.2",
+    "zstandard>=0.25.0",
+    "errant>=3.0.0",
+    "spacy>=3.8.11",
+    "pip>=25.3",
+]
+requires-python = ">=3.12"
+
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.2.0",
+    "ruff>=0.11.7",
+]
+
+[tool.ruff]
+line-length = 120  # Matches black's default, adjust as needed
+target-version = "py312"  # Matches your requires-python
+exclude = [".git", "__pycache__", ".venv", "*.ipynb", "FMSeq"]
+
+[tool.ruff.format]
+quote-style = "double"  # Consistent with black
+#indent-style = "tab"
+skip-magic-trailing-comma = false
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = [
+    "E", # pycodestyle errors
+    "F", # pyflakes
+    "W", # pycodestyle warnings
+    "I", # isort
+    "UP", # pyupgrade
+    "B", # flake8-bugbear
+#    "D", # pydocstyle (optional, for docstrings)
+]
+ignore = ["D100", "D103", "D103", "D104"]  # Example: Ignore missing module/public docstrings
+
